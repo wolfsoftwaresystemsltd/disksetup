@@ -1,0 +1,85 @@
+#!/bin/bash
+#
+# Script to configure unused NVMe drives into a resilient RAID 1 array.
+# This script should be run on each server that has the unused drives.
+# It will:
+# 1. Create a RAID 1 (mirror) array from two specified NVMe drives.
+# 2. Format the new array with the XFS filesystem.
+# 3. Mount the new array at /data and configure fstab for persistence.
+#
+
+set -e # Exit immediately if a command exits with a non-zero status.
+
+# --- CONFIGURATION ---
+# The two unused NVMe drives to be used for the RAID 1 array.
+DRIVE_1="/dev/nvme0n1"
+DRIVE_2="/dev/nvme1n1"
+
+# The name of the new RAID device.
+RAID_DEVICE="/dev/md3"
+
+# The mount point for the new storage.
+MOUNT_POINT="/data"
+# --- END OF CONFIGURATION ---
+
+
+echo ">>> Starting storage configuration..."
+
+# 1. Install necessary tools
+echo ">>> Installing mdadm and xfsprogs..."
+apt-get update
+apt-get install -y mdadm xfsprogs --quiet
+
+# 2. Create the RAID 1 Array
+if [ -e "$RAID_DEVICE" ]; then
+    echo ">>> RAID device ${RAID_DEVICE} already exists. Skipping creation."
+else
+    echo ">>> Creating RAID 1 array on ${RAID_DEVICE} from ${DRIVE_1} and ${DRIVE_2}..."
+    # We use non-interactive mode with 'yes' to answer any prompts automatically.
+    yes | mdadm --create --verbose "${RAID_DEVICE}" --level=1 --raid-devices=2 "${DRIVE_1}" "${DRIVE_2}"
+    echo ">>> RAID 1 array created. Syncing will continue in the background."
+fi
+
+# 3. Format the new array with XFS
+# We check if a filesystem already exists on the device to avoid reformatting.
+if blkid "${RAID_DEVICE}" > /dev/null 2>&1; then
+    echo ">>> Filesystem already exists on ${RAID_DEVICE}. Skipping format."
+else
+    echo ">>> Formatting ${RAID_DEVICE} with XFS filesystem..."
+    mkfs.xfs -f "${RAID_DEVICE}"
+    echo ">>> Formatting complete."
+fi
+
+# 4. Create Mount Point
+if [ -d "$MOUNT_POINT" ]; then
+    echo ">>> Mount point ${MOUNT_POINT} already exists."
+else
+    echo ">>> Creating mount point at ${MOUNT_POINT}..."
+    mkdir -p "${MOUNT_POINT}"
+fi
+
+# 5. Configure fstab for persistence
+# Get the UUID of the RAID device for a stable mount reference.
+RAID_UUID=$(blkid -s UUID -o value "${RAID_DEVICE}")
+if grep -q "UUID=${RAID_UUID}" /etc/fstab; then
+    echo ">>> fstab entry for ${RAID_DEVICE} already exists."
+else
+    echo ">>> Adding fstab entry for ${RAID_DEVICE} to mount at ${MOUNT_POINT}..."
+    echo "UUID=${RAID_UUID}  ${MOUNT_POINT}   xfs    defaults,nofail   0   2" >> /etc/fstab
+fi
+
+# 6. Mount all filesystems defined in fstab
+echo ">>> Mounting all filesystems..."
+mount -a
+
+# 7. Save the new RAID configuration so the system knows about it on boot
+echo ">>> Updating mdadm configuration..."
+# Create or update the mdadm config file with the details of the new array.
+mdadm --detail --scan >> /etc/mdadm/mdadm.conf
+
+
+echo ""
+echo "--- STORAGE CONFIGURATION COMPLETE ---"
+echo "The new ~2TB RAID 1 array is now mounted at ${MOUNT_POINT}."
+echo "You can verify this by running the command: df -h"
+echo "You can check the RAID sync status with: cat /proc/mdstat"
